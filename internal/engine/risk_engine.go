@@ -119,4 +119,95 @@ func (re *RiskEngine) EvaluateOrder(ctx context.Context, order *model.Order) *mo
 	re.fatFingerDetector.RecordPrice(order.Symbol, order.Price)
 	re.recordOrderID(order.ClOrdID)
 
-	// Populate risk
+	// Populate risk metrics
+	result.RiskMetrics["position"] = float64(re.positionTracker.GetPosition(order.AccountID, order.Symbol))
+	result.RiskMetrics["notional"] = re.notionalTracker.GetCurrentNotional(order.AccountID)
+	result.RiskMetrics["circuit_state"] = 0 // Closed
+
+	re.recordResult(result, start)
+	return result
+}
+
+// GetAccountLimits returns current limit status for an account.
+func (re *RiskEngine) GetAccountLimits(accountID string) *model.AccountLimits {
+	limits := &model.AccountLimits{
+		AccountID:             accountID,
+		CircuitBreakerTripped: re.circuitBreaker.IsTripped(accountID),
+		OrdersEvaluatedToday:  re.evaluationsTotal.Load(),
+		OrdersRejectedToday:   re.rejectionsTotal.Load(),
+	}
+
+	// Collect position limits (simplified — in production, iterate all symbols)
+	// For demo, we return a snapshot of common symbols
+	symbols := []string{"AAPL", "GOOG", "MSFT", "EUR/USD"}
+	for _, symbol := range symbols {
+		pos := re.positionTracker.GetPosition(accountID, symbol)
+		maxLong, maxShort, _ := re.positionTracker.GetPositionLimit(accountID, symbol)
+
+		utilization := 0.0
+		if pos > 0 && maxLong > 0 {
+			utilization = float64(pos) / float64(maxLong) * 100
+		} else if pos < 0 && maxShort > 0 {
+			utilization = float64(-pos) / float64(maxShort) * 100
+		}
+
+		limits.PositionLimits = append(limits.PositionLimits, model.PositionLimit{
+			Symbol:           symbol,
+			MaxLongPosition:  maxLong,
+			MaxShortPosition: maxShort,
+			CurrentPosition:  pos,
+			UtilizationPct:   utilization,
+		})
+	}
+
+	// Notional limit
+	currentNotional := re.notionalTracker.GetCurrentNotional(accountID)
+	maxNotional := 100_000_000.00 // Default
+	limits.NotionalLimit = &model.NotionalLimit{
+		MaxNotionalValue:     maxNotional,
+		CurrentNotionalValue: currentNotional,
+		UtilizationPct:       currentNotional / maxNotional * 100,
+	}
+
+	return limits
+}
+
+// ResetCircuitBreaker resets the breaker for an account.
+func (re *RiskEngine) ResetCircuitBreaker(accountID string) error {
+	return re.circuitBreaker.Reset(accountID)
+}
+
+// isDuplicate checks if an order ID was recently processed.
+func (re *RiskEngine) isDuplicate(clOrdID string) bool {
+	_, exists := re.recentOrderIDs.Load(clOrdID)
+	return exists
+}
+
+// recordOrderID marks an order ID as processed.
+func (re *RiskEngine) recordOrderID(clOrdID string) {
+	re.recentOrderIDs.Store(clOrdID, time.Now())
+}
+
+// recordResult updates statistics and logs the evaluation.
+func (re *RiskEngine) recordResult(result *model.EvaluationResult, start time.Time) {
+	latency := time.Since(start)
+	result.LatencyNs = latency.Nanoseconds()
+	result.EvaluatedAt = time.Now()
+
+	re.evaluationLatency.Add(latency.Nanoseconds())
+
+	if result.Decision == model.DecisionRejected {
+		re.rejectionsTotal.Add(1)
+		re.logger.Warn("Order rejected",
+			zap.String("evaluation_id", result.EvaluationID),
+			zap.String("code", result.RejectReason.Code.String()),
+			zap.String("message", result.RejectReason.Message),
+			zap.Duration("latency", latency),
+		)
+	} else {
+		re.logger.Debug("Order accepted",
+			zap.String("evaluation_id", result.EvaluationID),
+			zap.Duration("latency", latency),
+		)
+	}
+}
