@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package risk.v1;
+
+option go_package = "github.com/CharlesMfouapon/real-time-risk-engine/proto/risk/v1;riskv1";
+
+// RiskService evaluates orders against pre-trade risk limits.
+// Every order must pass this check before reaching the order book.
+service RiskService {
+  // EvaluateOrder checks a single order against all active risk rules.
+  // Returns ACCEPTED, REJECTED with reason, or ERROR.
+  rpc EvaluateOrder(EvaluateOrderRequest) returns (EvaluateOrderResponse);
+
+  // GetAccountLimits returns current limit status for an account.
+  rpc GetAccountLimits(GetAccountLimitsRequest) returns (GetAccountLimitsResponse);
+
+  // ResetCircuitBreaker manually resets a tripped circuit breaker.
+  // Requires administrative credentials in production.
+  rpc ResetCircuitBreaker(ResetCircuitBreakerRequest) returns (ResetCircuitBreakerResponse);
+
+  // HealthCheck returns service health and current load metrics.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message EvaluateOrderRequest {
+  string cl_ord_id = 1;       // Client order ID from FIX
+  string account_id = 2;      // Trading account
+  string symbol = 3;          // Instrument symbol
+  string side = 4;            // "BUY" or "SELL"
+  double price = 5;           // Limit price
+  int64 quantity = 6;         // Order quantity
+  string ord_type = 7;        // "LIMIT", "MARKET", "STOP"
+  int64 timestamp_ns = 8;     // Order entry time (nanoseconds)
+}
+
+message EvaluateOrderResponse {
+  enum Decision {
+    DECISION_UNSPECIFIED = 0;
+    DECISION_ACCEPTED = 1;
+    DECISION_REJECTED = 2;
+    DECISION_ERROR = 3;
+  }
+  
+  message RejectReason {
+    enum Code {
+      CODE_UNSPECIFIED = 0;
+      CODE_POSITION_LIMIT_EXCEEDED = 1;
+      CODE_NOTIONAL_LIMIT_EXCEEDED = 2;
+      CODE_FAT_FINGER_DETECTED = 3;
+      CODE_CIRCUIT_BREAKER_OPEN = 4;
+      CODE_DUPLICATE_ORDER = 5;
+      CODE_INVALID_SYMBOL = 6;
+      CODE_ACCOUNT_FROZEN = 7;
+      CODE_RATE_LIMIT_EXCEEDED = 8;
+    }
+    Code code = 1;
+    string message = 2;
+    double current_exposure = 3;
+    double limit_value = 4;
+  }
+  
+  Decision decision = 1;
+  string evaluation_id = 2;       // Unique ID for this evaluation
+  int64 evaluation_latency_ns = 3; // Time spent evaluating
+  optional RejectReason reject_reason = 4;
+  map<string, double> risk_metrics = 5; // Current risk metrics snapshot
+}
+
+message GetAccountLimitsRequest {
+  string account_id = 1;
+}
+
+message GetAccountLimitsResponse {
+  message PositionLimit {
+    string symbol = 1;
+    int64 max_long_position = 2;
+    int64 max_short_position = 3;
+    int64 current_position = 4;
+    double utilization_pct = 5;
+  }
+  
+  message NotionalLimit {
+    double max_notional_value = 1;
+    double current_notional_value = 2;
+    double utilization_pct = 3;
+  }
+  
+  string account_id = 1;
+  repeated PositionLimit position_limits = 2;
+  optional NotionalLimit notional_limit = 3;
+  bool circuit_breaker_tripped = 4;
+  int64 orders_evaluated_today = 5;
+  int64 orders_rejected_today = 6;
+}
+
+message ResetCircuitBreakerRequest {
+  string account_id = 1;
+  string reason = 2;
+}
+
+message ResetCircuitBreakerResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_HEALTHY = 1;
+    STATUS_DEGRADED = 2;
+    STATUS_UNHEALTHY = 3;
+  }
+  Status status = 1;
+  int64 evaluations_per_second = 2;
+  double avg_evaluation_latency_ns = 3;
+  double p99_evaluation_latency_ns = 4;
+  int64 active_accounts = 5;
+  int64 tripped_circuit_breakers = 6;
+}
